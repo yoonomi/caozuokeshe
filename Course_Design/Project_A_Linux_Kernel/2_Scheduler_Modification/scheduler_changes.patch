@@ -1,0 +1,118 @@
+--- a/include/linux/sched.h	2003-08-25 13:44:44.000000000 +0800
++++ b/include/linux/sched.h	2025-06-20 02:30:00.000000000 +0800
+@@ -320,6 +320,9 @@
+ 	unsigned long sleep_avg;
+ 	unsigned long last_run;
+ 
++	/* New process priority boost mechanism */
++	unsigned int has_run_before:1;      /* Flag: has this process run before? */
++
+ 	struct list_head run_list;
+ 	prio_array_t *array;
+ 
+--- a/kernel/fork.c	2003-08-25 13:44:44.000000000 +0800
++++ b/kernel/fork.c	2025-06-20 02:30:00.000000000 +0800
+@@ -758,6 +758,9 @@
+ 	/* copy all the process information */
+ 	if (copy_semundo(clone_flags, p))
+ 		goto bad_fork_cleanup_audit;
++	
++	/* Initialize new process scheduler flag */
++	p->has_run_before = 0;              /* Mark as never run */
+ 	if (copy_files(clone_flags, p))
+ 		goto bad_fork_cleanup_semundo;
+ 	if (copy_fs(clone_flags, p))
+
+--- a/kernel/sched.c	2003-08-25 13:44:44.000000000 +0800
++++ b/kernel/sched.c	2025-06-20 02:30:00.000000000 +0800
+@@ -116,6 +116,12 @@
+ #define TASK_INTERACTIVE(p) \
+ 	((p)->prio <= (p)->static_prio - DELTA(p))
+ 
++/*
++ * New process priority boost configuration
++ */
++#define NEW_PROCESS_PRIORITY_BOOST    100    /* Large priority bonus for new processes */
++
++
+ /*
+  * task_timeslice() scales user-nice values [ -20 ... 19 ]
+  * to time slice values.
+@@ -162,6 +168,38 @@
+ 	return SCALE(DEF_TIMESLICE, 0, p->static_prio);
+ }
+ 
++/*
++ * goodness - Calculate process scheduling priority
++ * @p: process to evaluate
++ * @this_cpu: current CPU number
++ * @this_mm: current process memory management structure
++ *
++ * Returns: goodness weight value, higher value means higher priority
++ * 0 means process is not schedulable (timeslice exhausted)
++ * >1000 means process has CPU affinity and high priority
++ */
++static inline int goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
++{
++	int weight;
++
++	/*
++	 * CPU affinity optimization: give huge bonus if process last ran on this CPU
++	 * Purpose: reduce cache misses, improve performance
++	 */
++	if (p->processor == this_cpu)
++		weight = 1000 + p->counter;
++	else
++		weight = p->counter;
++
++	if (weight) {
++		/*
++		 * NEW PROCESS PRIORITY BOOST MECHANISM
++		 * Give large priority bonus to processes that have never run before
++		 */
++		if (!p->has_run_before) {
++			weight += NEW_PROCESS_PRIORITY_BOOST;
++		}
++		
++		/* Memory management optimization: shared mm or kernel threads get small bonus */
++		if (p->mm == this_mm || !p->mm)
++			weight += 1;
++		
++		/* Nice value influence: lower nice value means higher priority */
++		weight += 20 - p->nice;
++	}
++	
++	return weight;
++}
++
+ #define GRANULARITY	(10 * HZ / 1000 ? : 1)
+ 
+ #ifdef CONFIG_SMP
+@@ -832,6 +870,25 @@
+ 	}
+ 
+ pick_next_task:
++	/*
++	 * Find the process with highest goodness value
++	 */
++	list_for_each(tmp, &runqueue_head) {
++		p = list_entry(tmp, struct task_struct, run_list);
++		if (can_schedule(p, this_cpu)) {
++			int weight = goodness(p, this_cpu, prev->active_mm);
++			if (weight > c)
++				c = weight, next = p;
++		}
++	}
++
++	/*
++	 * Mark the selected process as having run before (if it's a new process)
++	 */
++	if (next && next != prev && !next->has_run_before) {
++		next->has_run_before = 1;
++		printk(KERN_INFO "SCHED: Process %d (%s) runs for the first time\n", next->pid, next->comm);
++	}
++
+ 	if (!c) {
+ 		struct task_struct *p;
+ 		/*
+</rewritten_file> 

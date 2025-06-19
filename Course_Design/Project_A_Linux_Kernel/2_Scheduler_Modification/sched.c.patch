@@ -1,0 +1,118 @@
+--- a/kernel/sched/core.c	2024-01-15 10:30:00.000000000 +0800
++++ b/kernel/sched/core.c	2024-01-15 15:45:00.000000000 +0800
+@@ -4500,6 +4500,14 @@
+ 	}
+ }
+ 
++/**
++ * 自定义调度策略 - 优先级提升机制
++ * 当进程等待时间超过阈值时，临时提升其优先级
++ */
++static void boost_waiting_tasks(struct rq *rq)
++{
++	struct task_struct *p;
++	unsigned long now = jiffies;
++	const unsigned long wait_threshold = HZ * 2; // 2秒等待阈值
++
++	list_for_each_entry(p, &rq->cfs.tasks, se.group_node) {
++		if (p->state == TASK_RUNNING && 
++		    (now - p->se.exec_start) > wait_threshold) {
++			// 临时提升优先级
++			if (p->prio > 100) {
++				p->prio -= 5;
++				printk(KERN_INFO "Boosted task %d priority to %d\n", 
++				       p->pid, p->prio);
++			}
++		}
++	}
++}
++
+ /*
+  * schedule() is the main scheduler function.
+  *
+@@ -4510,6 +4518,9 @@
+ {
+ 	struct task_struct *prev, *next;
+ 	unsigned long *switch_count;
++	
++	/* 应用自定义调度优化 */
++	boost_waiting_tasks(this_rq());
+ 	struct rq_flags rf;
+ 	struct rq *rq;
+ 	int cpu;
+@@ -6000,6 +6011,25 @@
+ 	return retval;
+ }
+ 
++/**
++ * 自定义系统调用：设置进程调度参数
++ * 允许用户空间程序调整调度行为
++ */
++SYSCALL_DEFINE2(set_sched_param, pid_t, pid, int, boost_factor)
++{
++	struct task_struct *p;
++	
++	rcu_read_lock();
++	p = find_task_by_vpid(pid);
++	if (!p) {
++		rcu_read_unlock();
++		return -ESRCH;
++	}
++	
++	/* 应用调度参数调整 */
++	p->se.load.weight *= boost_factor;
++	rcu_read_unlock();
++	
++	return 0;
++}
++
+ /**
+  * sys_sched_setscheduler - set/change the scheduler policy and RT priority
+  * @pid: the pid in question.
+
+--- a/include/linux/sched.h	2024-01-15 10:30:00.000000000 +0800
++++ b/include/linux/sched.h	2024-01-15 15:45:00.000000000 +0800
+@@ -1500,6 +1500,9 @@
+ 	/* Stalled cycles per task: */
+ 	u64				stalled_cycles_sum;
+ 	u64				stalled_cycles_max;
++	
++	/* 自定义调度参数 */
++	unsigned long			last_boost_time;
++	int				boost_count;
+ 
+ 	/* CPU-specific state of this task: */
+ 	struct thread_struct		thread;
+
+--- a/kernel/sched/fair.c	2024-01-15 10:30:00.000000000 +0800
++++ b/kernel/sched/fair.c	2024-01-15 15:45:00.000000000 +0800
+@@ -850,6 +850,18 @@
+ 	return delta_exec * fact >> 10;
+ }
+ 
++/**
++ * 自定义虚拟时间计算
++ * 根据进程特性调整虚拟时间增长速度
++ */
++static u64 calc_custom_delta_fair(u64 delta, struct sched_entity *se)
++{
++	/* 对交互式进程给予更多时间片 */
++	if (se->load.weight < NICE_0_LOAD) {
++		delta = delta * 8 / 10;  // 减少虚拟时间增长
++	}
++	return delta;
++}
+ 
+ static void update_curr(struct cfs_rq *cfs_rq)
+ {
+@@ -875,6 +887,9 @@
+ 	curr->exec_start = now;
+ 
+ 	schedstat_set(curr->statistics.exec_max,
++	
++	/* 应用自定义虚拟时间计算 */
++	delta_exec = calc_custom_delta_fair(delta_exec, curr);
+ 		      max(delta_exec, curr->statistics.exec_max));
+ 
+ 	curr->sum_exec_runtime += delta_exec;
+ } 

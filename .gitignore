@@ -1,0 +1,40 @@
+# Compiled executables
+*.o
+*.out
+*.exe
+test_syscall
+test_new_process_priority
+scheduler_test
+comprehensive_rw_test
+disk_demo
+disk_test
+file_rw_test
+format_demo
+fs_format_test
+simple_rw_test
+user_protection_test
+filesystem
+
+# Image files (large)
+*.img
+
+# Temporary files
+*~
+*.tmp
+*.swp
+*.swo
+
+# Build directories
+build/
+dist/
+
+# IDE files
+.vscode/
+.idea/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log 

@@ -1,0 +1,280 @@
+--- a/include/linux/sched.h	2003-08-25 13:44:44.000000000 +0800
++++ b/include/linux/sched.h	2025-06-20 02:00:00.000000000 +0800
+@@ -320,6 +320,12 @@
+ 	unsigned long sleep_avg;
+ 	unsigned long last_run;
+ 
++	/* 新进程优先级提升机制相关字段 */
++	unsigned int has_run_before:1;      /* 进程是否已经运行过 */
++	unsigned long first_run_time;       /* 首次运行时间戳 */
++	unsigned int run_count;             /* 运行次数计数器 */
++	unsigned int new_process_boost;     /* 新进程加成值 */
++
+ 	struct list_head run_list;
+ 	prio_array_t *array;
+ 
+--- a/kernel/fork.c	2003-08-25 13:44:44.000000000 +0800
++++ b/kernel/fork.c	2025-06-20 02:00:00.000000000 +0800
+@@ -758,6 +758,12 @@
+ 	/* copy all the process information */
+ 	if (copy_semundo(clone_flags, p))
+ 		goto bad_fork_cleanup_audit;
++	
++	/* 初始化新进程调度字段 */
++	p->has_run_before = 0;              /* 标记为未运行 */
++	p->first_run_time = 0;              /* 初始化首次运行时间 */
++	p->run_count = 0;                   /* 初始化运行计数 */
++	p->new_process_boost = NEW_PROCESS_BOOST;  /* 设置新进程加成 */
+ 	if (copy_files(clone_flags, p))
+ 		goto bad_fork_cleanup_semundo;
+ 	if (copy_fs(clone_flags, p))
+
+--- a/kernel/sched.c	2003-08-25 13:44:44.000000000 +0800
++++ b/kernel/sched.c	2025-06-20 02:00:00.000000000 +0800
+@@ -116,6 +116,16 @@
+ #define TASK_INTERACTIVE(p) \
+ 	((p)->prio <= (p)->static_prio - DELTA(p))
+ 
++/*
++ * 新进程优先级提升机制配置参数
++ */
++#define NEW_PROCESS_BOOST    50      /* 新进程基础加成 */
++#define MAX_BOOST_RUNS       5       /* 最大优惠运行次数 */
++#define DECAY_FACTOR         10      /* 优先级衰减因子 */
++#define MIN_NEW_TIMESLICE    10      /* 新进程最小时间片 */
++#define MAX_NEW_PROCESS_PER_SEC 100  /* 每秒最大新进程数（防fork炸弹） */
++
++/* 统计变量 */
++static unsigned long new_process_scheduled = 0;
++static unsigned long boost_applied_count = 0;
++static unsigned long last_check_time = 0;
++static unsigned int new_process_count = 0;
++
+ /*
+  * task_timeslice() scales user-nice values [ -20 ... 19 ]
+  * to time slice values.
+@@ -162,6 +172,68 @@
+ 	return SCALE(DEF_TIMESLICE, 0, p->static_prio);
+ }
+ 
++/**
++ * goodness - 计算进程调度优先级
++ * @p: 待评估的进程
++ * @this_cpu: 当前CPU编号  
++ * @this_mm: 当前进程的内存管理结构
++ *
++ * 返回值：goodness权重值，越大优先级越高
++ * 0表示进程不可调度（时间片用完）
++ * >1000表示具有CPU亲和性的高优先级进程
++ */
++static inline int goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
++{
++	int weight;
++
++	/*
++	 * CPU亲和性优化：如果进程上次在当前CPU运行，给予巨大加成
++	 * 目的：减少缓存失效，提高性能
++	 */
++	if (p->processor == this_cpu)
++		weight = 1000 + p->counter;
++	else
++		weight = p->counter;
++
++	if (weight) {
++		/*
++		 * 新进程优先级提升机制
++		 * 目标：使新创建的普通进程获得比已运行进程更高的优先级
++		 */
++		if (!p->has_run_before) {
++			weight += p->new_process_boost;     /* 新进程基础加成 */
++			boost_applied_count++;              /* 统计计数 */
++		}
++		
++		/*
++		 * 渐进式优先级衰减机制
++		 * 基于运行次数逐渐降低新进程优势，保持长期公平性
++		 */
++		if (p->run_count < MAX_BOOST_RUNS) {
++			int decay_boost = (MAX_BOOST_RUNS - p->run_count) * DECAY_FACTOR;
++			weight += decay_boost;
++		}
++		
++		/*
++		 * 原有优化机制保持不变
++		 */
++		/* 内存管理优化：共享内存或内核线程获得小幅加成 */
++		if (p->mm == this_mm || !p->mm)
++			weight += 1;
++		
++		/* Nice值影响：nice值越低，优先级越高 */
++		weight += 20 - p->nice;
++	}
++	
++	return weight;
++}
++
++/*
++ * 原有的goodness函数保留作为old_goodness，供对比测试使用
++ */
++static inline int old_goodness(struct task_struct * p, int this_cpu, struct mm_struct *this_mm)
++{
++	int weight;
++
++	if (p->processor == this_cpu)
++		weight = 1000 + p->counter;
++	else
++		weight = p->counter;
++
++	if (weight) {
++		if (p->mm == this_mm || !p->mm)
++			weight += 1;
++		weight += 20 - p->nice;
++	}
++	return weight;
++}
++
+ #define GRANULARITY	(10 * HZ / 1000 ? : 1)
+ 
+ #ifdef CONFIG_SMP
+@@ -832,6 +904,35 @@
+ 	}
+ 
+ pick_next_task:
++	/*
++	 * 防止fork炸弹攻击的保护机制
++	 * 限制每秒创建的新进程数量
++	 */
++	if (jiffies - last_check_time > HZ) {
++		last_check_time = jiffies;
++		new_process_count = 0;
++	}
++
++	/*
++	 * 遍历运行队列，选择goodness值最高的进程
++	 */
++	list_for_each(tmp, &runqueue_head) {
++		p = list_entry(tmp, struct task_struct, run_list);
++		if (can_schedule(p, this_cpu)) {
++			int weight = goodness(p, this_cpu, prev->active_mm);
++			if (weight > c)
++				c = weight, next = p;
++		}
++	}
++
++	/*
++	 * 更新即将运行进程的状态
++	 */
++	if (next && next != prev) {
++		if (!next->has_run_before) {
++			next->has_run_before = 1;
++			next->first_run_time = jiffies;
++			new_process_scheduled++;
++			
++			/* 为新进程提供更大的初始时间片 */
++			if (next->counter < MIN_NEW_TIMESLICE) {
++				next->counter = MIN_NEW_TIMESLICE;
++			}
++			
++			/* 记录新进程首次运行日志 */
++			printk(KERN_INFO "SCHED: First run of process %d (%s), boost=%d\n", 
++			       next->pid, next->comm, next->new_process_boost);
++		}
++		next->run_count++;
++		
++		/* 检测是否需要应用防fork炸弹保护 */
++		if (++new_process_count > MAX_NEW_PROCESS_PER_SEC) {
++			/* 对超额新进程禁用加成 */
++			if (!next->has_run_before) {
++				next->has_run_before = 1;
++				printk(KERN_WARNING "SCHED: Fork bomb protection: disabling boost for PID %d\n", 
++				       next->pid);
++			}
++		}
++	}
++
+ 	if (!c) {
+ 		struct task_struct *p;
+ 		/*
+
+--- a/fs/proc/array.c	2003-08-25 13:44:44.000000000 +0800
++++ b/fs/proc/array.c	2025-06-20 02:00:00.000000000 +0800
+@@ -165,6 +165,14 @@
+ 		buffer[len] = '\0';
+ 	}
+ 	return len;
++	
++	/* 添加新进程调度状态信息显示 */
++	res += sprintf(buffer + res,
++		"HasRunBefore:\t%d\n"
++		"RunCount:\t%u\n"
++		"FirstRunTime:\t%lu\n"
++		"NewProcessBoost:\t%u\n",
++		task->has_run_before,
++		task->run_count,
++		task->first_run_time,
++		task->new_process_boost);
+ }
+ 
+ static inline char * task_state(struct task_struct *p, char *buffer)
+
+--- a/kernel/sysctl.c	2003-08-25 13:44:44.000000000 +0800
++++ b/kernel/sysctl.c	2025-06-20 02:00:00.000000000 +0800
+@@ -60,6 +60,13 @@
+ extern int pid_max_min, pid_max_max;
+ extern int sysctl_lower_zone_protection;
+ 
++/* 新进程调度参数的sysctl支持 */
++extern int new_process_boost;
++extern int max_boost_runs;
++extern int decay_factor;
++extern int min_new_timeslice;
++extern unsigned long boost_applied_count;
++extern unsigned long new_process_scheduled;
++
+ #if defined(CONFIG_X86_LOCAL_APIC) && defined(CONFIG_X86)
+ int unknown_nmi_panic;
+ extern int proc_unknown_nmi_panic(ctl_table *, int, struct file *,
+@@ -298,6 +305,46 @@
+ 		.strategy	= &sysctl_jiffies,
+ 	},
+ #endif
++	/* 新进程调度优化参数控制 */
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "new_process_boost",
++		.data		= &new_process_boost,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= &zero,
++		.extra2		= &one_hundred,
++	},
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "max_boost_runs",
++		.data		= &max_boost_runs,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= &proc_dointvec_minmax,
++		.extra1		= &one,
++		.extra2		= &ten,
++	},
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "new_process_scheduled",
++		.data		= &new_process_scheduled,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0444,
++		.proc_handler	= &proc_doulongvec_minmax,
++	},
++	{
++		.ctl_name	= CTL_UNNUMBERED,
++		.procname	= "boost_applied_count",
++		.data		= &boost_applied_count,
++		.maxlen		= sizeof(unsigned long),
++		.mode		= 0444,
++		.proc_handler	= &proc_doulongvec_minmax,
++	},
+ 	{ .ctl_name = 0 }
+ };
+ 
