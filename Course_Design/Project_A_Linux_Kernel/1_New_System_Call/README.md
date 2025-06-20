@@ -5,7 +5,7 @@
 
 ## 文件说明
 - `syscall_impl.c`: 新系统调用的内核实现
-- `user_test.c`: 用户空间测试程序
+- `test_syscall.c`: 用户空间测试程序
 - `README.md`: 本说明文档
 
 ## 系统调用功能
@@ -54,12 +54,12 @@ sudo reboot
 
 ### 4. 编译测试程序
 ```bash
-gcc -o user_test user_test.c
+make
 ```
 
 ### 5. 运行测试
 ```bash
-./user_test
+./test_syscall
 ```
 
 ## 测试说明

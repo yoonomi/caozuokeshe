@@ -22,7 +22,6 @@ Course_Design/
 - **文件**: 
   - `syscall_impl.c` - 系统调用实现
   - `test_syscall.c` - 用户空间测试程序
-  - `user_test.c` - 功能验证程序
 
 #### 2. 调度器修改
 - **目标**: 修改Linux 2.4调度器，使新进程获得更高优先级
